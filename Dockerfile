@@ -32,4 +32,4 @@ RUN pnpm ui:build
 
 ENV NODE_ENV=production
 
-CMD ["node", "dist/index.js"]
+CMD ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
