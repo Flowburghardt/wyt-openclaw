@@ -31,6 +31,9 @@ RUN pnpm ui:build
 
 ENV NODE_ENV=production
 
+# Allow non-root user to write temp files during runtime/tests.
+RUN chown -R node:node /app
+
 # Security hardening: Run as non-root user
 # The node:22-bookworm image includes a 'node' user (uid 1000)
 # This reduces the attack surface by preventing container escape via root privileges
@@ -38,4 +41,6 @@ ENV NODE_ENV=production
 RUN chmod 755 /root
 USER node
 
+# Coolify/Docker: Bind to LAN interface on configured port.
+# Upstream default is loopback-only with --allow-unconfigured.
 CMD ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
