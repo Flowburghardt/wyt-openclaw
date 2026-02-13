@@ -1,6 +1,8 @@
+import path from "node:path";
 import type { CanvasHostServer } from "../canvas-host/server.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
 import type { RuntimeEnv } from "../runtime.js";
+import type { ControlUiRootState } from "./control-ui.js";
 import type { startBrowserControlServerIfEnabled } from "./server-browser.js";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { registerSkillsChangeListener } from "../agents/skills/refresh.js";
@@ -18,6 +20,11 @@ import {
 } from "../config/config.js";
 import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
 import { clearAgentRunContext, onAgentEvent } from "../infra/agent-events.js";
+import {
+  ensureControlUiAssetsBuilt,
+  resolveControlUiRootOverrideSync,
+  resolveControlUiRootSync,
+} from "../infra/control-ui-assets.js";
 import { isDiagnosticsEnabled } from "../infra/diagnostic-events.js";
 import { logAcceptedEnvOption } from "../infra/env.js";
 import { createExecApprovalForwarder } from "../infra/exec-approval-forwarder.js";
@@ -34,7 +41,9 @@ import {
 import { scheduleGatewayUpdateCheck } from "../infra/update-startup.js";
 import { startDiagnosticHeartbeat, stopDiagnosticHeartbeat } from "../logging/diagnostic.js";
 import { createSubsystemLogger, runtimeForLogger } from "../logging/subsystem.js";
+import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { runOnboardingWizard } from "../wizard/onboarding.js";
+import { createAuthRateLimiter, type AuthRateLimiter } from "./auth-rate-limit.js";
 import { startGatewayConfigReloader } from "./config-reload.js";
 import { ExecApprovalManager } from "./exec-approval-manager.js";
 import { NodeRegistry } from "./node-registry.js";
@@ -87,6 +96,7 @@ const logReload = log.child("reload");
 const logHooks = log.child("hooks");
 const logPlugins = log.child("plugins");
 const logWsControl = log.child("ws");
+const gatewayRuntime = runtimeForLogger(log);
 const canvasRuntime = runtimeForLogger(logCanvas);
 
 export type GatewayServer = {
@@ -253,12 +263,51 @@ export async function startGatewayServer(
     openResponsesEnabled,
     openResponsesConfig,
     controlUiBasePath,
+    controlUiRoot: controlUiRootOverride,
     resolvedAuth,
     tailscaleConfig,
     tailscaleMode,
   } = runtimeConfig;
   let hooksConfig = runtimeConfig.hooksConfig;
   const canvasHostEnabled = runtimeConfig.canvasHostEnabled;
+
+  // Create auth rate limiter only when explicitly configured.
+  const rateLimitConfig = cfgAtStart.gateway?.auth?.rateLimit;
+  const authRateLimiter: AuthRateLimiter | undefined = rateLimitConfig
+    ? createAuthRateLimiter(rateLimitConfig)
+    : undefined;
+
+  let controlUiRootState: ControlUiRootState | undefined;
+  if (controlUiRootOverride) {
+    const resolvedOverride = resolveControlUiRootOverrideSync(controlUiRootOverride);
+    const resolvedOverridePath = path.resolve(controlUiRootOverride);
+    controlUiRootState = resolvedOverride
+      ? { kind: "resolved", path: resolvedOverride }
+      : { kind: "invalid", path: resolvedOverridePath };
+    if (!resolvedOverride) {
+      log.warn(`gateway: controlUi.root not found at ${resolvedOverridePath}`);
+    }
+  } else if (controlUiEnabled) {
+    let resolvedRoot = resolveControlUiRootSync({
+      moduleUrl: import.meta.url,
+      argv1: process.argv[1],
+      cwd: process.cwd(),
+    });
+    if (!resolvedRoot) {
+      const ensureResult = await ensureControlUiAssetsBuilt(gatewayRuntime);
+      if (!ensureResult.ok && ensureResult.message) {
+        log.warn(`gateway: ${ensureResult.message}`);
+      }
+      resolvedRoot = resolveControlUiRootSync({
+        moduleUrl: import.meta.url,
+        argv1: process.argv[1],
+        cwd: process.cwd(),
+      });
+    }
+    controlUiRootState = resolvedRoot
+      ? { kind: "resolved", path: resolvedRoot }
+      : { kind: "missing" };
+  }
 
   const wizardRunner = opts.wizardRunner ?? runOnboardingWizard;
   const { wizardSessions, findRunningWizard, purgeWizardSession } = createWizardSessionTracker();
@@ -277,6 +326,7 @@ export async function startGatewayServer(
     wss,
     clients,
     broadcast,
+    broadcastToConnIds,
     agentRunSeq,
     dedupe,
     chatRunState,
@@ -285,16 +335,19 @@ export async function startGatewayServer(
     addChatRun,
     removeChatRun,
     chatAbortControllers,
+    toolEventRecipients,
   } = await createGatewayRuntimeState({
     cfg: cfgAtStart,
     bindHost,
     port,
     controlUiEnabled,
     controlUiBasePath,
+    controlUiRoot: controlUiRootState,
     openAiChatCompletionsEnabled,
     openResponsesEnabled,
     openResponsesConfig,
     resolvedAuth,
+    rateLimiter: authRateLimiter,
     gatewayTls,
     hooksConfig: () => hooksConfig,
     pluginRegistry,
@@ -399,11 +452,13 @@ export async function startGatewayServer(
   const agentUnsub = onAgentEvent(
     createAgentEventHandler({
       broadcast,
+      broadcastToConnIds,
       nodeSendToSession,
       agentRunSeq,
       chatRunState,
       resolveSessionKeyForRun,
       clearAgentRunContext,
+      toolEventRecipients,
     }),
   );
 
@@ -414,6 +469,18 @@ export async function startGatewayServer(
   let heartbeatRunner = startHeartbeatRunner({ cfg: cfgAtStart });
 
   void cron.start().catch((err) => logCron.error(`failed to start: ${String(err)}`));
+
+  // Recover pending outbound deliveries from previous crash/restart.
+  void (async () => {
+    const { recoverPendingDeliveries } = await import("../infra/outbound/delivery-queue.js");
+    const { deliverOutboundPayloads } = await import("../infra/outbound/deliver.js");
+    const logRecovery = log.child("delivery-recovery");
+    await recoverPendingDeliveries({
+      deliver: deliverOutboundPayloads,
+      log: logRecovery,
+      cfg: cfgAtStart,
+    });
+  })().catch((err) => log.error(`Delivery recovery failed: ${String(err)}`));
 
   const execApprovalManager = new ExecApprovalManager();
   const execApprovalForwarder = createExecApprovalForwarder();
@@ -431,6 +498,7 @@ export async function startGatewayServer(
     canvasHostEnabled: Boolean(canvasHost),
     canvasHostServerPort,
     resolvedAuth,
+    rateLimiter: authRateLimiter,
     gatewayMethods,
     events: GATEWAY_EVENTS,
     logGateway: log,
@@ -453,6 +521,7 @@ export async function startGatewayServer(
       incrementPresenceVersion,
       getHealthVersion,
       broadcast,
+      broadcastToConnIds,
       nodeSendToSession,
       nodeSendToAllSubscribed,
       nodeSubscribe,
@@ -467,6 +536,7 @@ export async function startGatewayServer(
       chatDeltaSentAt: chatRunState.deltaSentAt,
       addChatRun,
       removeChatRun,
+      registerToolEventRecipient: toolEventRecipients.add,
       dedupe,
       wizardSessions,
       findRunningWizard,
@@ -509,6 +579,16 @@ export async function startGatewayServer(
     logChannels,
     logBrowser,
   }));
+
+  // Run gateway_start plugin hook (fire-and-forget)
+  {
+    const hookRunner = getGlobalHookRunner();
+    if (hookRunner?.hasHooks("gateway_start")) {
+      void hookRunner.runGatewayStart({ port }, { port }).catch((err) => {
+        log.warn(`gateway_start hook failed: ${String(err)}`);
+      });
+    }
+  }
 
   const { applyHotReload, requestGatewayRestart } = createGatewayReloadHandlers({
     deps,
@@ -576,6 +656,20 @@ export async function startGatewayServer(
 
   return {
     close: async (opts) => {
+      // Run gateway_stop plugin hook before shutdown
+      {
+        const hookRunner = getGlobalHookRunner();
+        if (hookRunner?.hasHooks("gateway_stop")) {
+          try {
+            await hookRunner.runGatewayStop(
+              { reason: opts?.reason ?? "gateway stopping" },
+              { port },
+            );
+          } catch (err) {
+            log.warn(`gateway_stop hook failed: ${String(err)}`);
+          }
+        }
+      }
       if (diagnosticsEnabled) {
         stopDiagnosticHeartbeat();
       }
@@ -584,6 +678,7 @@ export async function startGatewayServer(
         skillsRefreshTimer = null;
       }
       skillsChangeUnsub();
+      authRateLimiter?.dispose();
       await close(opts);
     },
   };

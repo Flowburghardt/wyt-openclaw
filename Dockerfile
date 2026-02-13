@@ -24,7 +24,7 @@ COPY scripts ./scripts
 RUN pnpm install --frozen-lockfile
 
 COPY . .
-RUN OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build
+RUN pnpm build
 # Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
 ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:build
@@ -43,4 +43,4 @@ USER node
 
 # Coolify/Docker: Bind to LAN interface on configured port.
 # Upstream default is loopback-only with --allow-unconfigured.
-CMD ["node", "dist/index.js", "gateway", "--bind", "lan", "--port", "18789"]
+CMD ["node", "openclaw.mjs", "gateway", "--bind", "lan", "--port", "18789"]

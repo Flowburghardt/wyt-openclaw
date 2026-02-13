@@ -1,5 +1,5 @@
-import { Client } from "@buape/carbon";
-import { GatewayIntents, GatewayPlugin } from "@buape/carbon/gateway";
+import type { GatewayPlugin } from "@buape/carbon/gateway";
+import { Client, ReadyListener, type BaseMessageInteractiveComponent } from "@buape/carbon";
 import { Routes } from "discord-api-types/v10";
 import { inspect } from "node:util";
 import type { HistoryEntry } from "../../auto-reply/reply/history.js";
@@ -26,7 +26,10 @@ import { fetchDiscordApplicationId } from "../probe.js";
 import { resolveDiscordChannelAllowlist } from "../resolve-channels.js";
 import { resolveDiscordUserAllowlist } from "../resolve-users.js";
 import { normalizeDiscordToken } from "../token.js";
+import { createAgentComponentButton, createAgentSelectMenu } from "./agent-components.js";
 import { createExecApprovalButton, DiscordExecApprovalHandler } from "./exec-approvals.js";
+import { createDiscordGatewayPlugin } from "./gateway-plugin.js";
+import { registerGateway, unregisterGateway } from "./gateway-registry.js";
 import {
   DiscordMessageListener,
   DiscordPresenceListener,
@@ -39,6 +42,7 @@ import {
   createDiscordCommandArgFallbackButton,
   createDiscordNativeCommand,
 } from "./native-command.js";
+import { resolveDiscordPresenceUpdate } from "./presence.js";
 
 export type MonitorDiscordOpts = {
   token?: string;
@@ -118,25 +122,6 @@ function formatDiscordDeployErrorDetails(err: unknown): string {
     }
   }
   return details.length > 0 ? ` (${details.join(", ")})` : "";
-}
-
-function resolveDiscordGatewayIntents(
-  intentsConfig?: import("../../config/types.discord.js").DiscordIntentsConfig,
-): number {
-  let intents =
-    GatewayIntents.Guilds |
-    GatewayIntents.GuildMessages |
-    GatewayIntents.MessageContent |
-    GatewayIntents.DirectMessages |
-    GatewayIntents.GuildMessageReactions |
-    GatewayIntents.DirectMessageReactions;
-  if (intentsConfig?.presence) {
-    intents |= GatewayIntents.GuildPresences;
-  }
-  if (intentsConfig?.guildMembers) {
-    intents |= GatewayIntents.GuildMembers;
-  }
-  return intents;
 }
 
 export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
@@ -220,7 +205,8 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
           const channels = guildCfg?.channels ?? {};
           const channelKeys = Object.keys(channels).filter((key) => key !== "*");
           if (channelKeys.length === 0) {
-            entries.push({ input: guildKey, guildKey });
+            const input = /^\d+$/.test(guildKey) ? `guild:${guildKey}` : guildKey;
+            entries.push({ input, guildKey });
             continue;
           }
           for (const channelKey of channelKeys) {
@@ -473,7 +459,10 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       })
     : null;
 
-  const components = [
+  const agentComponentsConfig = discordCfg.agentComponents ?? {};
+  const agentComponentsEnabled = agentComponentsConfig.enabled ?? true;
+
+  const components: BaseMessageInteractiveComponent[] = [
     createDiscordCommandArgFallbackButton({
       cfg,
       discordConfig: discordCfg,
@@ -484,6 +473,43 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
 
   if (execApprovalsHandler) {
     components.push(createExecApprovalButton({ handler: execApprovalsHandler }));
+  }
+
+  if (agentComponentsEnabled) {
+    components.push(
+      createAgentComponentButton({
+        cfg,
+        accountId: account.accountId,
+        guildEntries,
+        allowFrom,
+        dmPolicy,
+      }),
+    );
+    components.push(
+      createAgentSelectMenu({
+        cfg,
+        accountId: account.accountId,
+        guildEntries,
+        allowFrom,
+        dmPolicy,
+      }),
+    );
+  }
+
+  class DiscordStatusReadyListener extends ReadyListener {
+    async handle(_data: unknown, client: Client) {
+      const gateway = client.getPlugin<GatewayPlugin>("gateway");
+      if (!gateway) {
+        return;
+      }
+
+      const presence = resolveDiscordPresenceUpdate(discordCfg);
+      if (!presence) {
+        return;
+      }
+
+      gateway.updatePresence(presence);
+    }
   }
 
   const client = new Client(
@@ -497,18 +523,10 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
     },
     {
       commands,
-      listeners: [],
+      listeners: [new DiscordStatusReadyListener()],
       components,
     },
-    [
-      new GatewayPlugin({
-        reconnect: {
-          maxAttempts: Number.POSITIVE_INFINITY,
-        },
-        intents: resolveDiscordGatewayIntents(discordCfg.intents),
-        autoInteractions: true,
-      }),
-    ],
+    [createDiscordGatewayPlugin({ discordConfig: discordCfg, runtime })],
   );
 
   await deployDiscordCommands({ client, runtime, enabled: nativeEnabled });
@@ -591,6 +609,9 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
   }
 
   const gateway = client.getPlugin<GatewayPlugin>("gateway");
+  if (gateway) {
+    registerGateway(account.accountId, gateway);
+  }
   const gatewayEmitter = getDiscordGatewayEmitter(gateway);
   const stopGatewayLogging = attachDiscordGatewayLogging({
     emitter: gatewayEmitter,
@@ -657,6 +678,7 @@ export async function monitorDiscordProvider(opts: MonitorDiscordOpts = {}) {
       },
     });
   } finally {
+    unregisterGateway(account.accountId);
     stopGatewayLogging();
     if (helloTimeoutId) {
       clearTimeout(helloTimeoutId);
@@ -683,3 +705,7 @@ async function clearDiscordNativeCommands(params: {
     params.runtime.error?.(danger(`discord: failed to clear native commands: ${String(err)}`));
   }
 }
+
+export const __testing = {
+  createDiscordGatewayPlugin,
+};

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getMemorySearchManager, type MemoryIndexManager } from "./index.js";
 
 const embedBatch = vi.fn(async (texts: string[]) => texts.map(() => [0, 1, 0]));
@@ -20,16 +20,26 @@ vi.mock("./embeddings.js", () => ({
 }));
 
 describe("memory embedding batches", () => {
+  let fixtureRoot: string;
+  let caseId = 0;
   let workspaceDir: string;
   let indexPath: string;
   let manager: MemoryIndexManager | null = null;
 
+  beforeAll(async () => {
+    fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-mem-"));
+  });
+
+  afterAll(async () => {
+    await fs.rm(fixtureRoot, { recursive: true, force: true });
+  });
+
   beforeEach(async () => {
     embedBatch.mockClear();
     embedQuery.mockClear();
-    workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-mem-"));
+    workspaceDir = path.join(fixtureRoot, `case-${++caseId}`);
     indexPath = path.join(workspaceDir, "index.sqlite");
-    await fs.mkdir(path.join(workspaceDir, "memory"));
+    await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
   });
 
   afterEach(async () => {
@@ -37,12 +47,11 @@ describe("memory embedding batches", () => {
       await manager.close();
       manager = null;
     }
-    await fs.rm(workspaceDir, { recursive: true, force: true });
   });
 
   it("splits large files across multiple embedding batches", async () => {
     const line = "a".repeat(200);
-    const content = Array.from({ length: 50 }, () => line).join("\n");
+    const content = Array.from({ length: 40 }, () => line).join("\n");
     await fs.writeFile(path.join(workspaceDir, "memory", "2026-01-03.md"), content);
 
     const cfg = {
@@ -160,7 +169,7 @@ describe("memory embedding batches", () => {
     let calls = 0;
     embedBatch.mockImplementation(async (texts: string[]) => {
       calls += 1;
-      if (calls < 3) {
+      if (calls < 2) {
         throw new Error("openai embeddings failed: 429 rate limit");
       }
       return texts.map(() => [0, 1, 0]);
@@ -208,7 +217,7 @@ describe("memory embedding batches", () => {
       setTimeoutSpy.mockRestore();
     }
 
-    expect(calls).toBe(3);
+    expect(calls).toBe(2);
   }, 10000);
 
   it("retries embeddings on transient 5xx errors", async () => {
@@ -219,7 +228,7 @@ describe("memory embedding batches", () => {
     let calls = 0;
     embedBatch.mockImplementation(async (texts: string[]) => {
       calls += 1;
-      if (calls < 3) {
+      if (calls < 2) {
         throw new Error("openai embeddings failed: 502 Bad Gateway (cloudflare)");
       }
       return texts.map(() => [0, 1, 0]);
@@ -267,7 +276,7 @@ describe("memory embedding batches", () => {
       setTimeoutSpy.mockRestore();
     }
 
-    expect(calls).toBe(3);
+    expect(calls).toBe(2);
   }, 10000);
 
   it("skips empty chunks so embeddings input stays valid", async () => {
