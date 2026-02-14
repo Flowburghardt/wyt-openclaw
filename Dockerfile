@@ -16,6 +16,16 @@ RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
       rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
     fi
 
+# Skill dependencies: summarize, obsidian-cli, uv
+RUN npm install -g @steipete/summarize && \
+    curl -sL https://github.com/Yakitrak/notesmd-cli/releases/download/v0.3.0/notesmd-cli_0.3.0_linux_amd64.tar.gz | tar xz -C /usr/local/bin && \
+    mv /usr/local/bin/notesmd-cli /usr/local/bin/obsidian-cli && \
+    chmod +x /usr/local/bin/obsidian-cli && \
+    curl -LsSf https://astral.sh/uv/install.sh | env INSTALLER_NO_MODIFY_PATH=1 sh && \
+    cp /root/.local/bin/uv /usr/local/bin/uv && \
+    cp /root/.local/bin/uvx /usr/local/bin/uvx && \
+    chmod +x /usr/local/bin/uv /usr/local/bin/uvx
+
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY ui/package.json ./ui/package.json
 COPY patches ./patches
